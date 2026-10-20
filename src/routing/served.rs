@@ -54,13 +54,7 @@ impl Page {
     }
 
     pub fn modified_ms(&self) -> Option<u64> {
-        let modified = std::fs::metadata(&self.file).ok()?.modified().ok()?;
-        Some(
-            modified
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_millis() as u64,
-        )
+        modified_ms(&self.file)
     }
 }
 
@@ -188,6 +182,75 @@ fn find(segments: &[String], roots: &[PathBuf]) -> Option<Page> {
     None
 }
 
+/// The folder sessions publish into, when a server runs inside it rather than in a project of
+/// its own (`~/code/home/artifacts/2026-10-20-onboarding/story`): a `routing.servers` folder or
+/// a folder named `artifacts` above `dir`, else the folder above the nearest one holding an
+/// `.opencode-session`, within `dir`'s project.
+pub fn content_root(dir: &Path, servers: &[(String, PathBuf)]) -> Option<PathBuf> {
+    if let Some(folder) = servers
+        .iter()
+        .map(|(_, folder)| folder)
+        .filter(|folder| dir.starts_with(folder) && dir != folder.as_path())
+        .max_by_key(|folder| folder.components().count())
+    {
+        return Some(folder.clone());
+    }
+    let (project, _) = super::project_root(dir);
+    let mut current = dir.parent();
+    while let Some(d) = current {
+        if d.file_name().is_some_and(|n| n == "artifacts") {
+            return Some(d.to_path_buf());
+        }
+        if d == project {
+            break;
+        }
+        current = d.parent();
+    }
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        if d == project {
+            break;
+        }
+        if d.join(".opencode-session").is_file() {
+            return d.parent().map(Path::to_path_buf);
+        }
+        current = d.parent();
+    }
+    None
+}
+
+/// When the entries directly in `dir` last changed (folders too, `node_modules` and hidden ones
+/// aside), newest first: at most [`CHANGES`], within [`CHANGES_SPAN_MS`] of the newest.
+pub fn changes(dir: &Path) -> Vec<u64> {
+    let mut times: Vec<u64> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            !name.starts_with('.') && name != "node_modules"
+        })
+        .filter_map(|e| modified_ms(&e.path()))
+        .collect();
+    times.sort_unstable_by(|a, b| b.cmp(a));
+    let newest = times.first().copied().unwrap_or(0);
+    times
+        .into_iter()
+        .filter(|t| newest - t <= CHANGES_SPAN_MS)
+        .take(CHANGES)
+        .collect()
+}
+
+fn modified_ms(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64,
+    )
+}
+
 // MARK: Who published it
 
 /// The session a page names itself: `<meta name="opencode-session" content="ses_…">` in an HTML
@@ -293,9 +356,20 @@ pub struct Write {
     pub done: Option<u64>,
 }
 
-/// History read before the file last changed, and after it.
+/// History read before the first change looked at, and after the last.
 pub const BEFORE_MS: u64 = 30 * 60_000;
 pub const AFTER_MS: u64 = 60_000;
+/// For a server's own folder: how many of its newest entries are looked at, all changed within
+/// this long of the newest.
+const CHANGES: usize = 5;
+const CHANGES_SPAN_MS: u64 = 2 * 60 * 60_000;
+
+/// The window of history to read for `changed`.
+pub fn window(changed: &[u64]) -> Option<(u64, u64)> {
+    let first = changed.iter().min()?;
+    let last = changed.iter().max()?;
+    Some((first.saturating_sub(BEFORE_MS), last + AFTER_MS))
+}
 /// A call wrote the file if the file changed while it ran, give or take this.
 const SLACK_MS: u64 = 2_000;
 const READ_ONLY_TOOLS: [&str; 5] = ["read", "grep", "glob", "list", "webfetch"];
@@ -307,49 +381,67 @@ pub const USED: u32 = 60;
 pub const MARKED: u32 = 100;
 /// The serving process's folder, when the page is a file from elsewhere.
 pub const SERVER_ONLY: u32 = 15;
+/// The serving process's folder, when it's inside a folder sessions publish into: its project
+/// (the enclosing repository) says nothing about who made the page.
+pub const SERVER_IN_CONTENT: u32 = 0;
 
-/// One [`Source::Publisher`] clue per root session among `writes`: the ones whose call was
-/// running when the file last changed ([`WROTE`]), the others that named its folder shortly
-/// before ([`USED`]).
-pub fn writer_clues(page: &Page, modified_ms: u64, writes: &[Write]) -> Vec<Clue> {
-    let mut by_root: BTreeMap<String, (bool, &Write)> = BTreeMap::new();
+/// One [`Source::Publisher`] clue per root session among `writes`, given when the page's files
+/// last `changed` (epoch ms) and what to call them. A change was written by the session whose
+/// call (not a read) was running then. The session that wrote the most of them gets [`WROTE`]
+/// (each, on a tie); the others that wrote some, or only named the folder, get [`USED`].
+pub fn writer_clues(changed: &[u64], what: &str, writes: &[Write]) -> Vec<Clue> {
+    let wrote = |write: &Write, at: u64| {
+        !READ_ONLY_TOOLS.contains(&write.tool.as_str())
+            && matches!((write.ran, write.done), (Some(ran), Some(done))
+                if ran.saturating_sub(SLACK_MS) <= at && at <= done + SLACK_MS)
+    };
+    // Per root: how many changes it wrote, and a call to name (a writing one if any).
+    let mut by_root: BTreeMap<String, (usize, &Write)> = BTreeMap::new();
     for write in writes {
         let root = write.root.clone().unwrap_or_else(|| write.session.clone());
-        let wrote = !READ_ONLY_TOOLS.contains(&write.tool.as_str())
-            && matches!((write.ran, write.done), (Some(ran), Some(done))
-                if ran.saturating_sub(SLACK_MS) <= modified_ms && modified_ms <= done + SLACK_MS);
-        let entry = by_root.entry(root).or_insert((wrote, write));
-        if wrote && !entry.0 {
-            *entry = (true, write);
+        by_root.entry(root).or_insert((0, write));
+    }
+    for at in changed {
+        let mut roots: Vec<String> = writes
+            .iter()
+            .filter(|w| wrote(w, *at))
+            .map(|w| w.root.clone().unwrap_or_else(|| w.session.clone()))
+            .collect();
+        roots.sort();
+        roots.dedup();
+        for root in roots {
+            if let Some(entry) = by_root.get_mut(&root) {
+                entry.0 += 1;
+                if let Some(w) = writes.iter().find(|w| {
+                    wrote(w, *at) && w.root.as_ref().unwrap_or(&w.session) == &root
+                }) {
+                    entry.1 = w;
+                }
+            }
         }
     }
-    let name = page.file.file_name().map_or_else(
-        || page.file.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    );
+    let most = by_root.values().map(|(n, _)| *n).max().unwrap_or(0);
     by_root
         .into_iter()
-        .map(|(root, (wrote, write))| {
+        .map(|(root, (count, write))| {
             let by = if write.session == root {
                 "its"
             } else {
                 "its subagent's"
             };
-            let (points, note) = if wrote {
-                (
-                    WROTE,
-                    format!(
-                        "{by} {} call was running when {name} last changed",
-                        write.tool
-                    ),
-                )
-            } else {
-                (
+            let (points, note) = match (count, changed.len()) {
+                (0, _) => (
                     USED,
-                    format!(
-                        "{by} tool calls named the folder of {name} shortly before it last changed"
-                    ),
-                )
+                    format!("{by} tool calls named the folder of {what} shortly before it changed"),
+                ),
+                (n, 1) if n == most => (
+                    WROTE,
+                    format!("{by} {} call was running when {what} last changed", write.tool),
+                ),
+                (n, total) => (
+                    if n == most { WROTE } else { USED },
+                    format!("{by} tool calls wrote {n} of the last {total} changes to {what}"),
+                ),
             };
             Clue::new(
                 Source::Publisher,
@@ -385,11 +477,11 @@ pub fn path_clue(page: &Page) -> Option<Clue> {
 
 // MARK: OpenCode's history
 
-/// The tool calls in OpenCode's history whose input names `needle` from [`BEFORE_MS`] before
-/// `modified_ms` to [`AFTER_MS`] after, with their root sessions. Reads the local server's
+/// The tool calls in OpenCode's history whose input names `needle`, in assistant messages started
+/// between `from` and `to` (epoch ms), with their root sessions. Reads the local server's
 /// database read-only (found through the process `/api/info` names), with a time limit; any
 /// failure is no answer.
-pub fn opencode_writes(needle: &str, modified_ms: u64) -> Vec<Write> {
+pub fn opencode_writes(needle: &str, from: u64, to: u64) -> Vec<Write> {
     if cfg!(test) || crate::handoff::agent_host().is_some() {
         return Vec::new();
     }
@@ -401,7 +493,7 @@ pub fn opencode_writes(needle: &str, modified_ms: u64) -> Vec<Write> {
             "-readonly",
             "-json",
             &db.to_string_lossy(),
-            &writes_query(needle, modified_ms),
+            &writes_query(needle, from, to),
         ]),
         Duration::from_secs(3),
     ) else {
@@ -427,10 +519,8 @@ fn opencode_db() -> Option<PathBuf> {
 
 /// Tool calls (`session_message.data.content[]` parts of type `tool`) in assistant messages
 /// started in the window, whose `state.input` contains `needle`, with each one's root session.
-pub fn writes_query(needle: &str, modified_ms: u64) -> String {
+pub fn writes_query(needle: &str, from: u64, to: u64) -> String {
     let needle = needle.replace('\'', "''");
-    let from = modified_ms.saturating_sub(BEFORE_MS);
-    let to = modified_ms + AFTER_MS;
     format!(
         "WITH calls AS MATERIALIZED (
   SELECT m.session_id AS sid, json_extract(c.value, '$.name') AS tool,
@@ -611,7 +701,7 @@ mod tests {
             call("ses_canvas", "ses_canvas", "shell", 2_000, 2_100),
             call("ses_desk", "ses_desk", "read", 9_500, 10_000),
         ];
-        let clues = writer_clues(&page, 10_000, &writes);
+        let clues = writer_clues(&[10_000], "iteration-2.jpg", &writes);
         let points: Vec<(String, u32)> = clues
             .iter()
             .map(|c| match &c.pointer {
@@ -632,8 +722,69 @@ mod tests {
 
     #[test]
     fn the_history_query_quotes_its_needle() {
-        let sql = writes_query("it's", 40 * 60_000);
+        let sql = writes_query("it's", 600_000, 2_460_000);
         assert!(sql.contains("instr(m.data, 'it''s')"));
         assert!(sql.contains("BETWEEN 600000 AND 2460000"));
     }
+
+    /// Several changes: the session that wrote most of them is the publisher, a session that
+    /// wrote fewer is a runner-up, and a tie is a tie.
+    #[test]
+    fn the_session_that_wrote_most_of_a_folder_published_it() {
+        let call = |root: &str, tool: &str, ran: u64| Write {
+            session: format!("{root}_child"),
+            root: Some(root.into()),
+            tool: tool.into(),
+            ran: Some(ran),
+            done: Some(ran + 500),
+        };
+        let writes = vec![
+            call("ses_knobs", "edit", 1_000),
+            call("ses_knobs", "shell", 5_000),
+            call("ses_home", "shell", 9_000),
+            call("ses_home", "read", 13_000),
+        ];
+        let points = |changed: &[u64]| -> Vec<(String, u32)> {
+            writer_clues(changed, "story", &writes)
+                .iter()
+                .map(|c| match &c.pointer {
+                    Pointer::Session { id, .. } => (id.clone(), c.points.unwrap()),
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            points(&[13_000, 9_000, 5_000, 1_000]),
+            vec![("ses_home".into(), USED), ("ses_knobs".into(), WROTE)]
+        );
+        assert_eq!(
+            points(&[9_000, 5_000]),
+            vec![("ses_home".into(), WROTE), ("ses_knobs".into(), WROTE)]
+        );
+    }
+
+    #[test]
+    fn a_server_inside_a_publishing_folder_is_content() {
+        let base = temp("content");
+        std::fs::create_dir_all(base.join("home/.git")).unwrap();
+        let story = base.join("home/artifacts/2026-10-20-onboarding/story");
+        std::fs::create_dir_all(&story).unwrap();
+        assert_eq!(content_root(&story, &[]), Some(base.join("home/artifacts")));
+        // The publishing folder itself is a gallery, not content.
+        assert_eq!(content_root(&base.join("home/artifacts"), &[]), None);
+        let app = base.join("home/tools/app");
+        std::fs::create_dir_all(&app).unwrap();
+        assert_eq!(content_root(&app, &[]), None);
+        // A marker makes a folder content.
+        touch(&base.join("home/tools/.opencode-session"), "ses_x");
+        assert_eq!(content_root(&app, &[]), Some(base.join("home")));
+        // Config names a publishing folder.
+        let servers = vec![("http://x/".to_owned(), base.join("home/tools"))];
+        assert_eq!(content_root(&app, &servers), Some(base.join("home/tools")));
+        touch(&story.join("index.html"), "");
+        std::fs::create_dir_all(story.join("node_modules")).unwrap();
+        assert_eq!(changes(&story).len(), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }
+
