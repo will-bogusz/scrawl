@@ -1693,7 +1693,12 @@ mod tests {
         };
         let mut evidence = replay(saved, &bundle, &[]);
         let url = value["page"]["url"].as_str().unwrap();
-        look_at_page(Some(url), &mut evidence.clues, &mut evidence.candidates, &senses);
+        look_at_page(
+            Some(url),
+            &mut evidence.clues,
+            &mut evidence.candidates,
+            &senses,
+        );
         std::fs::remove_dir_all(root).unwrap();
         let judgement = decide(&evidence, Policy::Weigh);
         match &judgement.decision {
@@ -1783,4 +1788,3 @@ mod tests {
         );
     }
 }
-

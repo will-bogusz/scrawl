@@ -412,9 +412,10 @@ pub fn writer_clues(changed: &[u64], what: &str, writes: &[Write]) -> Vec<Clue> 
         for root in roots {
             if let Some(entry) = by_root.get_mut(&root) {
                 entry.0 += 1;
-                if let Some(w) = writes.iter().find(|w| {
-                    wrote(w, *at) && w.root.as_ref().unwrap_or(&w.session) == &root
-                }) {
+                if let Some(w) = writes
+                    .iter()
+                    .find(|w| wrote(w, *at) && w.root.as_ref().unwrap_or(&w.session) == &root)
+                {
                     entry.1 = w;
                 }
             }
@@ -436,7 +437,10 @@ pub fn writer_clues(changed: &[u64], what: &str, writes: &[Write]) -> Vec<Clue> 
                 ),
                 (n, 1) if n == most => (
                     WROTE,
-                    format!("{by} {} call was running when {what} last changed", write.tool),
+                    format!(
+                        "{by} {} call was running when {what} last changed",
+                        write.tool
+                    ),
                 ),
                 (n, total) => (
                     if n == most { WROTE } else { USED },
@@ -787,4 +791,3 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 }
-
