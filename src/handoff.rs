@@ -423,6 +423,10 @@ pub struct RoutingConfig {
     /// them.
     #[serde(default)]
     pub apps: std::collections::BTreeMap<String, String>,
+    /// The folder a URL prefix serves, for file servers whose pages aren't their own project's
+    /// (`{"https://studio.example.ts.net:8444/raw/": "~/code/home/artifacts"}`).
+    #[serde(default)]
+    pub servers: std::collections::BTreeMap<String, String>,
 }
 
 /// `true`/`false`, `"yes"`/`"on"`/`"1"` and their opposites, or a number (non-zero is on). Other
@@ -642,13 +646,24 @@ pub fn ensure_ingest_token() -> Result<String> {
 
 /// `routing.apps` from config.json, `~` expanded. Tests see none.
 pub fn routing_apps() -> Vec<(String, PathBuf)> {
+    routing_paths(|routing| routing.apps)
+}
+
+/// `routing.servers` in config.json: URL prefixes and the folders they serve, `~` expanded.
+pub fn routing_servers() -> Vec<(String, PathBuf)> {
+    routing_paths(|routing| routing.servers)
+}
+
+fn routing_paths(
+    pick: fn(RoutingConfig) -> std::collections::BTreeMap<String, String>,
+) -> Vec<(String, PathBuf)> {
     if cfg!(test) {
         return Vec::new();
     }
     let home = dirs::home_dir().unwrap_or_default();
     config()
         .routing
-        .map(|routing| routing.apps)
+        .map(pick)
         .unwrap_or_default()
         .into_iter()
         .map(|(id, path)| {

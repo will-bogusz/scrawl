@@ -33,6 +33,9 @@ pub struct Evidence {
     pub candidates: Vec<Candidate>,
     /// The capture's end, epoch ms; recency is measured from here.
     pub now_ms: u64,
+    /// The browser tab's URL, when there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// A destination someone stated. Obeyed, never weighed.
@@ -106,9 +109,12 @@ pub enum Source {
     Page,
     /// The process serving the tab's port on this Mac.
     Port,
+    /// Who published the file the tab shows, when a server serves it from outside its own
+    /// project: the session the page names, or the one whose tool call wrote the file.
+    Publisher,
     /// The captured terminal's focused pane.
     Terminal,
-    /// The captured window's document.
+    /// The file the tab shows, when it's from outside the server's project: its path's words.
     Document,
     /// The session OpenCode Desktop showed last.
     Viewed,
@@ -127,6 +133,7 @@ impl Source {
         match self {
             Self::Page => "sdk",
             Self::Port => "localhost",
+            Self::Publisher => "publisher",
             Self::Terminal => "terminal",
             Self::Document => "document",
             Self::Viewed => "viewed",
@@ -140,6 +147,7 @@ impl Source {
         match self {
             Self::Page => "page",
             Self::Port => "port",
+            Self::Publisher => "publisher",
             Self::Terminal => "terminal",
             Self::Document => "document",
             Self::Viewed => "viewed",
@@ -152,11 +160,11 @@ impl Source {
     /// Full points for a clue of this source that names a candidate.
     fn points(self) -> u32 {
         match self {
-            Self::Page | Self::Port => 95,
+            Self::Page | Self::Port | Self::Publisher => 95,
             Self::Terminal => 70,
-            Self::Document | Self::Viewed => 60,
+            Self::Viewed => 60,
             Self::App => 50,
-            Self::Title => 40,
+            Self::Title | Self::Document => 40,
             Self::Speech => 25,
         }
     }
@@ -607,11 +615,13 @@ fn alternatives(ranking: &[Scored]) -> Vec<Scored> {
     picked
 }
 
-/// The candidates, plus a bare one for each session a page names that wasn't read.
+/// The candidates, plus a bare one for each session a page or its publisher names that wasn't
+/// read.
 fn with_named_sessions(evidence: &Evidence) -> Vec<Candidate> {
     let mut candidates = evidence.candidates.clone();
     for clue in &evidence.clues {
-        if let (Source::Page, Pointer::Session { id, .. }) = (clue.source, &clue.pointer)
+        if let (Source::Page | Source::Publisher, Pointer::Session { id, .. }) =
+            (clue.source, &clue.pointer)
             && !candidates.iter().any(|c| &c.id == id)
         {
             candidates.push(bare(id));
@@ -1157,6 +1167,7 @@ mod tests {
             clues,
             candidates: sessions(),
             now_ms: NOW,
+            url: None,
         }
     }
 

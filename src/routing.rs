@@ -11,6 +11,7 @@
 //! [`look`] gathers (`docs/routing.md`).
 
 pub mod look;
+pub mod served;
 pub mod smart;
 
 /// The experiment that routes Mac captures with [`smart`] (`handoff::experiment`).
@@ -181,16 +182,35 @@ pub fn browser_tab_url(bundle_id: &str) -> Option<String> {
 }
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::Output> {
+    use std::io::Read as _;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+    // Read as it's written: output larger than a pipe's buffer would otherwise stall the child.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => {
+                return Some(std::process::Output {
+                    status,
+                    stdout: stdout.join().ok()?,
+                    stderr: stderr.join().ok()?,
+                });
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
